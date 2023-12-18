@@ -27,6 +27,12 @@ type Mapper interface {
 	Install(Module) Mapper
 }
 
+type Mirror[T any] interface {
+	MirrorE(v any) (T, error)
+	Mirror(v any) T
+	Mapper
+}
+
 type Module func(Mapper)
 
 type TypeMatcher interface {

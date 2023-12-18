@@ -12,11 +12,14 @@ import (
 
 type Option struct {
 	ignoreEmpty                bool
+	ignoreEmptyFields          []string
+	ignoreDeepEmpty            bool
 	overwrite                  bool // slice not support overwrite, will panic
 	overwriteOriginalCopyField bool
 	context                    context.Context
 	skipUnsuited               bool
 	copyUnexported             bool
+	boolFalseAsEmpty           bool
 }
 
 type copyOption struct {
@@ -26,6 +29,7 @@ type copyOption struct {
 func NewOption() *Option {
 	return &Option{
 		ignoreEmpty:                false,
+		boolFalseAsEmpty:           true,
 		overwrite:                  true,
 		skipUnsuited:               true,
 		overwriteOriginalCopyField: false,
@@ -55,11 +59,36 @@ func (o *Option) SetSkipUnsuited(skipUnsuited bool) *Option {
 	return o
 }
 
+// 是否忽略 origin 中为空的字段，防止覆盖 target（指针非空无效）
 func (o *Option) SetIgnoreEmpty(ignoreEmpty bool) *Option {
 	o.ignoreEmpty = ignoreEmpty
 	return o
 }
 
+// 是否忽略 origin 中指定字段为空的情况，防止覆盖 target（指针非空无效）TODO 暂时仅支持一级
+func (o *Option) SetIgnoreEmptyField(fields []string) *Option {
+	o.ignoreEmptyFields = fields
+	for _, item := range fields {
+		if strings.ContainsAny(item, ".") {
+			panic("multi level not implemented yet")
+		}
+	}
+	return o
+}
+
+// bool false 是否算空
+func (o *Option) SetBoolFalseAsEmpty(boolFalseAsEmpty bool) *Option {
+	o.boolFalseAsEmpty = boolFalseAsEmpty
+	return o
+}
+
+// 是否忽略 origin 中为空的字段，防止覆盖 target（指针类型会取地址验证）
+func (o *Option) SetIgnoreDeepEmpty(ignoreDeepEmpty bool) *Option {
+	o.ignoreDeepEmpty = ignoreDeepEmpty
+	return o
+}
+
+// 忽略 target 中的字段
 func (o *Option) SetOverwriteOriginalCopyField(overwriteOriginalCopyField bool) *Option {
 	o.overwriteOriginalCopyField = overwriteOriginalCopyField
 	return o
@@ -79,7 +108,22 @@ func Instance(option *Option) Mapper {
 	mapper := &mapper{
 		converterRepository: newConverterRepository(option),
 	}
-	return mapper.Install(RFC3339Convertor)
+	return mapper
+}
+
+func InstanceMirror[T any](option *Option) Mirror[T] {
+	if option == nil {
+		option = NewOption()
+	} else if len(option.ignoreEmptyFields) > 0 {
+		panic("mirror instance can't ignore anything")
+	}
+
+	m := &mirror[T]{
+		mapper: &mapper{
+			converterRepository: newConverterRepository(option),
+		},
+	}
+	return m
 }
 
 func InstanceWithContext(ctx context.Context, option *Option) Mapper {
@@ -92,11 +136,15 @@ func InstanceWithContext(ctx context.Context, option *Option) Mapper {
 	mapper := &mapper{
 		converterRepository: newConverterRepository(option),
 	}
-	return mapper.Install(RFC3339Convertor)
+	return mapper
 }
 
 type mapper struct {
 	converterRepository *converterRepository
+}
+
+type mirror[T any] struct {
+	*mapper
 }
 
 type copyCommand struct {
@@ -106,6 +154,22 @@ type copyCommand struct {
 
 func (c *copyCommand) CopyTo(toValue interface{}) (err error) {
 	return c.mapper.copy(toValue, c.fromValue)
+}
+
+func (m *mirror[T]) MirrorE(v any) (T, error) {
+	var (
+		res = new(T)
+		err = m.mapper.copy(*res, v)
+	)
+	return *res, err
+}
+
+func (m *mirror[T]) Mirror(v any) T {
+	var (
+		res = new(T)
+		_   = m.mapper.copy(res, v)
+	)
+	return *res
 }
 
 func (m *mapper) From(fromValue interface{}) CopyCommand {
@@ -243,6 +307,17 @@ func (m *mapper) convertStruct(from, to reflect.Value, toType reflect.Type) (ref
 						default:
 							continue
 						}
+
+						// 首层拷贝结构体需要额外判断 ignoreDeepEmpty
+						if m.shouldIgnoreByDeepEmpty(fromValue) {
+							continue
+						}
+
+						// 首层拷贝结构体需要额外判断 ignoreEmptyFields
+						if m.shouldIgnoreByEmptyFields(fromValue, fromField.Name) {
+							continue
+						}
+
 						if transformerMethod, ok := m.converterRepository.transformer[toField.Name]; ok {
 							f := reflect.ValueOf(transformerMethod)
 							if isFuncSuitable(fromValue.Type(), f.Type().In(0)) {
@@ -278,9 +353,65 @@ func (m *mapper) convertStruct(from, to reflect.Value, toType reflect.Type) (ref
 	return to, nil
 }
 
-func (m *mapper) shouldCopy(toValue, fromValue reflect.Value, options ...copyOption) bool {
-	if m.checkLevel(options...) && (m.converterRepository.ignoreEmpty && fromValue.IsZero() || !m.converterRepository.overwrite && !toValue.IsZero()) {
+func (m *mapper) shouldIgnoreByDeepEmpty(fromValue reflect.Value) bool {
+	if m.converterRepository.ignoreDeepEmpty {
+		if fromValue.Kind() == reflect.Pointer {
+			// from 是空指针需要被忽略
+			if fromValue.IsNil() {
+				return true
+			}
+			// 如果是非空指针需要验证指针指向的变量
+			return m.shouldIgnoreByDeepEmpty(fromValue.Elem())
+		}
+		if fromValue.Kind() == reflect.Array || fromValue.Kind() == reflect.Slice {
+			for i := 0; i < fromValue.Len(); i++ {
+				if !m.shouldIgnoreByDeepEmpty(fromValue.Index(i)) {
+					return false
+				}
+			}
+			return true
+		}
+		if fromValue.Kind() == reflect.Struct {
+			// 结构体需要验证每个字段
+			for i := 0; i < fromValue.NumField(); i++ {
+				if !m.shouldIgnoreByDeepEmpty(fromValue.Field(i)) {
+					return false
+				}
+			}
+			return true
+		}
+		return fromValue.IsZero()
+	}
+	return false
+}
+
+func (m *mapper) shouldIgnoreByEmptyFields(fromValue reflect.Value, fieldName string) bool {
+	if m.converterRepository.level != 0 {
 		return false
+	}
+	for _, field := range m.converterRepository.ignoreEmptyFields {
+		if field == fieldName && fromValue.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mapper) shouldCopy(toValue, fromValue reflect.Value, options ...copyOption) bool {
+	if m.checkLevel(options...) {
+		if m.shouldIgnoreByDeepEmpty(fromValue) {
+			return false
+		}
+
+		if m.converterRepository.ignoreEmpty && fromValue.IsZero() {
+			if fromValue.Kind() == reflect.Bool && !m.converterRepository.boolFalseAsEmpty {
+				return true
+			}
+			return false
+		}
+		if !m.converterRepository.overwrite && !toValue.IsZero() {
+			return false
+		}
 	}
 	return true
 }
@@ -316,7 +447,9 @@ func (m *mapper) convert(from, to reflect.Value, toType reflect.Type, options ..
 	if converter := m.converterRepository.Get(Target{To: toType, From: from.Type()}); converter != nil {
 		return converter(from, toType)
 
-	} else if from.Type().ConvertibleTo(toType) && m.checkLevel(options...) {
+	} else if from.Type().ConvertibleTo(toType) &&
+		m.checkLevel(options...) &&
+		!(m.converterRepository.ignoreDeepEmpty && toType.Kind() == reflect.Struct) { // 开启 ignoreDeepEmpty 防止同类型直接 convert，跳到后续进行 copy
 		return from.Convert(toType), nil
 
 	} else if m.canScan(toType) {
@@ -444,6 +577,9 @@ type converterRepository struct {
 	context                    context.Context
 	skipUnsuited               bool
 	ignoreEmpty                bool
+	ignoreEmptyFields          []string
+	boolFalseAsEmpty           bool
+	ignoreDeepEmpty            bool
 	overwrite                  bool
 	level                      int
 	lastLevel                  int
@@ -455,6 +591,9 @@ func newConverterRepository(option *Option) *converterRepository {
 		diffFieldsMapper:           make(map[string][]string),
 		transformer:                make(map[string]interface{}),
 		ignoreEmpty:                option.ignoreEmpty,
+		ignoreEmptyFields:          option.ignoreEmptyFields,
+		boolFalseAsEmpty:           option.boolFalseAsEmpty,
+		ignoreDeepEmpty:            option.ignoreDeepEmpty,
 		overwrite:                  option.overwrite,
 		context:                    option.context,
 		skipUnsuited:               option.skipUnsuited,
@@ -494,7 +633,7 @@ func getValueByFiledName(value reflect.Value, name string) reflect.Value {
 		case reflect.Struct:
 			return value.FieldByName(name)
 		default:
-			panic(fmt.Sprintf("not support get value from type[%s] by key[%s]", value.Kind(), name))
+			panic(fmt.Sprintf("not support get value from type [%s] by key [%s]", value.Kind(), name))
 		}
 	}
 }
